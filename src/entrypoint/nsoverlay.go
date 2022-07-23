@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -11,7 +12,7 @@ type NSOverlay struct {
 	Path string
 }
 
-func MergeOverlay(dir, tfPath, nsPath, stubsPath, modsPath string) (*NSOverlay, error) {
+func MergeOverlay(dir, tfPath, nsPath, modsPath, navsPath string) (*NSOverlay, error) {
 	n := new(NSOverlay)
 	if p, err := os.MkdirTemp(dir, "ns*"); err != nil {
 		return nil, fmt.Errorf("create temp dir in %q: %w", dir, err)
@@ -26,13 +27,13 @@ func MergeOverlay(dir, tfPath, nsPath, stubsPath, modsPath string) (*NSOverlay, 
 		n.Delete()
 		return nil, fmt.Errorf("merge northstar: %w", err)
 	}
-	if err := n.mergeStubs(stubsPath); err != nil {
-		n.Delete()
-		return nil, fmt.Errorf("merge northstar-stubs: %w", err)
-	}
 	if err := n.mergeMods(modsPath); err != nil {
 		n.Delete()
 		return nil, fmt.Errorf("merge extra mods: %w", err)
+	}
+	if err := n.mergeNavs(navsPath); err != nil {
+		n.Delete()
+		return nil, fmt.Errorf("merge navs: %w", err)
 	}
 	return n, nil
 }
@@ -55,10 +56,9 @@ func (n *NSOverlay) Autoexec() string {
 
 func (n *NSOverlay) mergeTF(p string) error {
 	for _, x := range []string{
-		"bin",
-		"r2",
+		"bin/x64_retail",
 		"vpk",
-		"platform",
+		"r2",
 		"build.txt",
 		"server.dll",
 	} {
@@ -67,7 +67,7 @@ func (n *NSOverlay) mergeTF(p string) error {
 				return err
 			}
 		}
-		if err := checkedSymlink(filepath.Join(p, x), filepath.Join(n.Path, x)); err != nil {
+		if err := checkedSymlink(filepath.Join(p, x), filepath.Join(n.Path, x), false); err != nil {
 			return err
 		}
 	}
@@ -75,6 +75,29 @@ func (n *NSOverlay) mergeTF(p string) error {
 }
 
 func (n *NSOverlay) mergeNS(p string) error {
+	if _, err := os.Stat(filepath.Join(p, "R2Northstar/mods/Northstar.CustomServers/mod/cfg/autoexec_ns_server.cfg")); err != nil {
+		return fmt.Errorf("northstar build missing server autoexec: %w", err)
+	}
+	if _, err := os.Stat(filepath.Join(p, "R2Northstar/placeholder_playerdata.pdata")); err != nil {
+		return fmt.Errorf("northstar build missing placeholder pdata: %w", err)
+	}
+	for _, x := range []string{
+		"bin/x64_dedi/d3d11.dll",
+		"bin/x64_dedi/GFSDK_SSAO.win64.dll",
+		"bin/x64_dedi/GFSDK_TXAA.win64.dll",
+	} {
+		if _, err := os.Stat(filepath.Join(p, x)); err != nil {
+			return fmt.Errorf("northstar build missing stubs (is it 1.6 or newer?): %w", err)
+		}
+	}
+	for _, x := range []string{
+		"R2Northstar/mods/Northstar.CustomServers/mod/maps/navmesh",
+		"R2Northstar/mods/Northstar.CustomServers/mod/maps/graphs",
+	} {
+		if _, err := os.Stat(filepath.Join(p, x)); err != nil {
+			return fmt.Errorf("northstar build missing navs (is it 1.7 or newer?): %w", err)
+		}
+	}
 	// ns wants to write into it's directory, and it also doesn't seem to work
 	// properly if it's dir is symlinked...
 	return filepath.Walk(p, func(path string, info fs.FileInfo, err error) error {
@@ -82,28 +105,24 @@ func (n *NSOverlay) mergeNS(p string) error {
 		if err != nil {
 			return err
 		}
-		if info.Name() == "autoexec_ns_server.cfg" {
+		switch filepath.ToSlash(r) {
+		case "R2Northstar/mods/Northstar.CustomServers/mod/cfg/autoexec_ns_server.cfg":
 			return os.WriteFile(filepath.Join(n.Path, r), nil, 0666)
+		case "R2Northstar/placeholder_playerdata.pdata":
+			return copyFile(path, filepath.Join(n.Path, r)) // northstar opens it read/write
+		case
+			"discord_game_sdk.dll",
+			"bin/x64_retail",
+			"bin/x64_retail/wsock32.dll",
+			"R2Northstar/plugins/DiscordRPC.dll":
+			return nil
 		}
 		if info.IsDir() {
 			return os.MkdirAll(filepath.Join(n.Path, r), 0777)
 		} else {
-			return checkedSymlink(path, filepath.Join(n.Path, r))
+			return checkedSymlink(path, filepath.Join(n.Path, r), false)
 		}
 	})
-}
-
-func (n *NSOverlay) mergeStubs(p string) error {
-	for _, x := range []string{
-		"d3d11.dll",
-		"GFSDK_SSAO.win64.dll",
-		"GFSDK_TXAA.win64.dll",
-	} {
-		if err := checkedSymlink(filepath.Join(p, x), filepath.Join(n.Path, x)); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 func (n *NSOverlay) mergeMods(p string) error {
@@ -115,16 +134,67 @@ func (n *NSOverlay) mergeMods(p string) error {
 		if _, err := os.Stat(filepath.Join(n.Path, "R2Northstar/mods", e.Name())); err == nil {
 			return fmt.Errorf("not allowed to override built-in mod %s", e.Name())
 		}
-		if err := checkedSymlink(filepath.Join(p, e.Name()), filepath.Join(n.Path, "R2Northstar/mods", e.Name())); err != nil {
+		if err := checkedSymlink(filepath.Join(p, e.Name()), filepath.Join(n.Path, "R2Northstar/mods", e.Name()), false); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func checkedSymlink(oldname, newname string) error {
+func (n *NSOverlay) mergeNavs(p string) error {
+	// note: sorted lexically
+	return filepath.Walk(p, func(path string, info fs.FileInfo, err error) error {
+		if info.IsDir() {
+			return nil
+		}
+		switch filepath.Ext(path) {
+		case ".ain":
+			return checkedSymlink(path, filepath.Join(n.Path, "R2Northstar", "mods", "Northstar.CustomServers", "mod", "maps", "graphs", info.Name()), true)
+		case ".nm":
+			return checkedSymlink(path, filepath.Join(n.Path, "R2Northstar", "mods", "Northstar.CustomServers", "mod", "maps", "navmesh", info.Name()), true)
+		}
+		return nil
+	})
+}
+
+func checkedSymlink(oldname, newname string, replace bool) error {
 	if _, err := os.Stat(oldname); err != nil {
 		return fmt.Errorf("access %q: %w", oldname, err)
 	}
+	if replace {
+		if _, err := os.Stat(newname); err == nil {
+			os.RemoveAll(newname)
+		}
+	}
 	return os.Symlink(oldname, newname)
+}
+
+func copyFile(src, dst string) error {
+	rf, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer rf.Close()
+
+	st, err := rf.Stat()
+	if err != nil {
+		return err
+	}
+
+	wf, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, st.Mode())
+	if err != nil {
+		return err
+	}
+	defer wf.Close()
+
+	if _, err := io.Copy(wf, rf); err != nil {
+		os.Remove(wf.Name())
+		return err
+	}
+
+	if err := wf.Close(); err != nil {
+		os.Remove(wf.Name())
+		return err
+	}
+	return nil
 }
